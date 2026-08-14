@@ -244,4 +244,3 @@ try:
     plt.show()
 except KeyboardInterrupt:
     print("Plot window closed. All files already saved successfully!")
-
