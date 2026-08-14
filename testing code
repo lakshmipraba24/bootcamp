@@ -1,0 +1,178 @@
+import sys
+import os
+import csv
+import datetime
+import numpy as np
+import librosa
+import noisereduce as nr
+from gtts import gTTS
+import playsound
+
+# ─── CONSTANTS (must match train_pipeline.py exactly) ─────────────────────────
+MAX_PAD_LEN  = 130
+N_MFCC       = 40
+SAMPLE_RATE  = 16000
+LOG_FILE     = "inference_log.csv"
+LABEL_FILE   = "class_dictionary.txt"
+
+def speak(text):
+    """Convert decoded text to speech using Google TTS and play it."""
+    try:
+        print(f"[TTS] Speaking: '{text}'")
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts_file = "tts_output.mp3"
+        tts.save(tts_file)
+        playsound.playsound(tts_file)
+        os.remove(tts_file)  # Clean up after playback
+    except Exception as e:
+        print(f"[TTS] Could not play audio: {e}")
+
+# ─── LABEL LOADER ─────────────────────────────────────────────────────────────
+def load_labels(label_file):
+    labels = {}
+    with open(label_file, 'r') as f:
+        for line in f:
+            if ':' in line:
+                idx, val = line.strip().split(':', 1)
+                labels[int(idx)] = val.strip()
+    return labels
+
+# ─── NOISE REDUCTION ──────────────────────────────────────────────────────────
+def denoise_audio(y, sr):
+    """Apply spectral noise reduction using the last 0.5s as noise profile."""
+    noise_sample = y[-int(sr * 0.5):] if len(y) > int(sr * 0.5) else y
+    return nr.reduce_noise(y=y, sr=sr, y_noise=noise_sample, prop_decrease=0.75)
+
+# ─── FEATURE EXTRACTION ───────────────────────────────────────────────────────
+def extract_mfcc(file_path, apply_denoising=True):
+    """Load audio, optionally denoise, then extract padded MFCC sequence."""
+    y, sr = librosa.load(file_path, sr=SAMPLE_RATE)
+
+    if apply_denoising:
+        print("[PRE] Applying noise reduction...")
+        y = denoise_audio(y, sr)
+
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC)  # (40, T)
+    mfccs = mfccs.T                                             # (T, 40)
+
+    if mfccs.shape[0] < MAX_PAD_LEN:
+        pad_width = MAX_PAD_LEN - mfccs.shape[0]
+        mfccs = np.pad(mfccs, ((0, pad_width), (0, 0)), mode='constant')
+    else:
+        mfccs = mfccs[:MAX_PAD_LEN, :]
+
+    return mfccs  # (130, 40)
+
+# ─── INFERENCE ────────────────────────────────────────────────────────────────
+def run_inference(audio_file, labels):
+    """Run model inference and return top-3 predictions."""
+    mfcc = extract_mfcc(audio_file)
+    input_data = np.expand_dims(mfcc, axis=0).astype(np.float32)  # (1, 130, 40)
+
+    try:
+        try:
+            import tflite_runtime.interpreter as tflite
+        except ImportError:
+            import tensorflow as tf
+            tflite = tf.lite
+        interpreter = tflite.Interpreter(model_path="raspberry_pi_model.tflite")
+        interpreter.allocate_tensors()
+        input_details  = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        print("[MODEL] Running CRNN inference via TFLite...")
+        interpreter.invoke()
+        output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+    except Exception as e:
+        print(f"[MODEL] TFLite unavailable ({type(e).__name__}). Using Keras .h5 model...")
+        import tensorflow as tf
+        model = tf.keras.models.load_model("speech_model.h5")
+        output_data = model.predict(input_data, verbose=0)[0]
+
+    top3_indices = np.argsort(output_data)[::-1][:3]
+    top3 = [(labels.get(i, 'Unknown'), float(output_data[i]) * 100) for i in top3_indices]
+    return top3
+
+# ─── DISPLAY TOP-3 ────────────────────────────────────────────────────────────
+def display_results(top3):
+    print("\n" + "=" * 52)
+    print("  DYSARTHRIC SPEECH DECODER - RESULTS")
+    print("=" * 52)
+    for rank, (phrase, confidence) in enumerate(top3, 1):
+        bar    = "#" * int(confidence / 5)
+        marker = " <-- TOP PICK" if rank == 1 else ""
+        print(f"  #{rank}  {phrase:<28} {confidence:5.2f}%  [{bar}]{marker}")
+    print("=" * 52)
+
+# ─── INFERENCE LOGGING ────────────────────────────────────────────────────────
+def log_result(audio_source, top_phrase, confidence):
+    file_exists = os.path.isfile(LOG_FILE)
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Timestamp", "Audio Source", "Predicted Phrase", "Confidence (%)"])
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([timestamp, audio_source, top_phrase, f"{confidence:.2f}"])
+    print(f"[LOG] Result saved to '{LOG_FILE}'")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    print("\n===================================================")
+    print("  Dysarthric Speech Decoder for Parkinson's Aid")
+    print("===================================================")
+
+    # Accept file path from command line or prompt
+    if len(sys.argv) >= 2:
+        audio_file = sys.argv[1].strip(' "\'')
+    else:
+        audio_file = input("\nEnter path to audio .wav file: ").strip(' "\'')
+
+    if not os.path.exists(audio_file):
+        # Try appending .wav if not present
+        if not audio_file.lower().endswith('.wav') and os.path.exists(audio_file + '.wav'):
+            audio_file = audio_file + '.wav'
+        else:
+            # Recursively search for matching filenames in the workspace
+            search_name = audio_file if audio_file.lower().endswith('.wav') else audio_file + '.wav'
+            base_search_name = os.path.basename(search_name).lower()
+            matches = []
+            for root, dirs, files in os.walk('.'):
+                if any(ignored in root for ignored in ['.git', '__pycache__', '.pytest_cache', 'venv', '.gemini']):
+                    continue
+                for f in files:
+                    if f.lower() == base_search_name:
+                        matches.append(os.path.join(root, f))
+            
+            if len(matches) == 1:
+                print(f"[FILE] Located matching file at: {matches[0]}")
+                audio_file = matches[0]
+            elif len(matches) > 1:
+                print(f"\n[FILE] Multiple matches found for '{search_name}':")
+                for index, match in enumerate(matches, 1):
+                    print(f"  [{index}] {match}")
+                try:
+                    selection = input("Select file number to run (or press Enter to cancel): ").strip()
+                    if selection.isdigit() and 1 <= int(selection) <= len(matches):
+                        audio_file = matches[int(selection) - 1]
+                    else:
+                        print("[ERROR] Selection canceled.")
+                        return
+                except KeyboardInterrupt:
+                    print("\n[ERROR] Interrupted.")
+                    return
+            else:
+                print(f"[ERROR] File not found: {audio_file}")
+                return
+
+    print(f"\n[FILE] Processing: {os.path.basename(audio_file)}")
+    labels = load_labels(LABEL_FILE)
+    top3   = run_inference(audio_file, labels)
+
+    display_results(top3)
+
+    top_phrase, top_confidence = top3[0]
+    speak(top_phrase)
+    log_result(os.path.basename(audio_file), top_phrase, top_confidence)
+
+if __name__ == "__main__":
+    main()
